@@ -11,6 +11,7 @@ use artifacts_api::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct CooldownTimestamps {
@@ -501,33 +502,97 @@ fn apply_headers(
         .header("Authorization", format!("Bearer {}", api_key))
 }
 
+#[derive(Debug, Error)]
+pub enum ActionRequestError {
+    #[error("unrecognized command: {0}")]
+    UnrecognizedCommand(String),
+
+    #[error("something with the api: {0:?}")]
+    ApiError(CodedErrorObject),
+
+    #[error("failed to construct request: {0}")]
+    UreqHttp(#[from] ureq::http::Error),
+
+    #[error("request error: {0}")]
+    Ureq(#[from] ureq::Error),
+
+    #[error("serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+fn action_request_uri(
+    character_name: &str,
+    action_name: &str,
+) -> Result<ureq::http::Uri, ActionRequestError> {
+    ureq::http::Uri::builder()
+        .scheme("https")
+        .authority("api.artifactsmmo.com")
+        .path_and_query(format!("/my/{character_name}/action/{action_name}",))
+        .build()
+        .map_err(Into::into)
+}
+
+fn action_post_request_builder(
+    api_key: &str,
+    character_name: &str,
+    action_name: &str,
+) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>, ActionRequestError> {
+    action_request_uri(character_name, action_name)
+        .inspect_err(|e| tracing::error!(?e))
+        .map(ureq::post)
+        .map(|req| {
+            // apply the required headers, along with the api-key
+            req.header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .config()
+                // make sure to config the request to not
+                // eat the error payload!
+                .http_status_as_error(false)
+                .build()
+        })
+}
+
+fn send_action_request_inner(
+    api_key: &str,
+    character_name: &str,
+    action_name: &str,
+    data: &[u8],
+) -> Result<ureq::http::Response<ureq::Body>, ActionRequestError> {
+    action_post_request_builder(api_key, character_name, action_name)
+        .and_then(|req| req.send(data).map_err(Into::into))
+}
+
 #[tracing::instrument(level = "info", skip(api_key))]
 pub fn send_action_request<Response>(
     api_key: &str,
     character_name: &str,
     action_name: &str,
     data: &[u8],
-) -> anyhow::Result<Response>
+) -> Result<Response, ActionRequestError>
 where
     Response: serde::de::DeserializeOwned,
 {
-    ureq::http::Uri::builder()
-        .scheme("https")
-        .authority("api.artifactsmmo.com")
-        .path_and_query(format!("/my/{character_name}/action/{action_name}",))
-        .build()
-        .inspect(|uri| tracing::info!(?uri))
-        .inspect_err(|e| tracing::error!(?e))
-        .map(ureq::post)
-        .map(|req| apply_headers(req, api_key))
-        .map_err(Into::into)
-        .and_then(|req| {
-            req.send(data)
-                .map(ureq::http::Response::into_body)
-                .map(ureq::Body::into_reader)
-                .map_err(Into::into)
-        })
-        .and_then(|rdr| serde_json::from_reader(rdr).map_err(Into::into))
+    send_action_request_inner(api_key, character_name, action_name, data).and_then(|res| {
+        let status = res.status();
+        tracing::info!("status is {status}");
+        let rdr = res.into_body().into_reader();
+        if status.is_client_error() | status.is_server_error() {
+            /// Simple wrapper type that the API returns in this case, no need
+            /// to pollute local code to have this functionality
+            #[derive(Debug, Default, Deserialize, Serialize)]
+            struct CodedErrorObjectResponse {
+                error: CodedErrorObject,
+            }
+
+            let output: CodedErrorObjectResponse = serde_json::from_reader(rdr)?;
+            Err(ActionRequestError::ApiError(output.error))
+        } else {
+            tracing::info!("status is good!");
+            let output: Response = serde_json::from_reader(rdr)?;
+            Ok(output)
+        }
+    })
 }
 
 /// This should be mapped to individual error-types but
@@ -537,17 +602,12 @@ where
 pub struct CodedErrorObject {
     pub code: u64,
     pub message: Box<str>,
-    pub data: Box<[u8]>,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct CodedErrorObjectResponse {
-    pub error: CodedErrorObject,
+    pub data: Option<serde_json::Value>,
 }
 
 pub struct ErrorData {
     pub message: Box<str>,
-    pub data: Box<[u8]>,
+    pub data: Option<serde_json::Value>,
 }
 
 /// code-field is omitted from variants
@@ -561,7 +621,7 @@ pub fn action_move_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&command_argument_map(command_arguments))
         .map_err(Into::into)
         .and_then(|data| {
@@ -579,7 +639,7 @@ pub fn action_move_command_handler(
 pub fn action_fight_command_handler(
     api_key: &str,
     character_name: &str,
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     send_action_request::<CharacterFightResponseSchema>(api_key, character_name, "fight", &[])
         .map(|res| ActionResponseDataSchema::Fight(res.data))
 }
@@ -588,7 +648,7 @@ pub fn action_fight_command_handler(
 pub fn action_rest_command_handler(
     api_key: &str,
     character_name: &str,
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     send_action_request::<CharacterRestResponseSchema>(api_key, character_name, "rest", &[])
         .map(|res| ActionResponseDataSchema::Rest(res.data))
 }
@@ -597,7 +657,7 @@ pub fn action_rest_command_handler(
 pub fn action_gather_command_handler(
     api_key: &str,
     character_name: &str,
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     send_action_request::<SkillResponseSchema>(api_key, character_name, "gathering", &[])
         .map(|res| ActionResponseDataSchema::Gather(res.data))
 }
@@ -609,7 +669,7 @@ pub fn action_unequip_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -630,7 +690,7 @@ pub fn action_craft_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&command_argument_map(command_arguments))
         .map_err(Into::into)
         .and_then(|data| {
@@ -646,7 +706,7 @@ pub fn action_equip_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -662,7 +722,7 @@ pub fn action_recycle_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&command_argument_map(command_arguments))
         .map_err(Into::into)
         .and_then(|data| {
@@ -683,7 +743,7 @@ pub fn action_use_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&command_argument_map(command_arguments))
         .map_err(Into::into)
         .and_then(|data| {
@@ -696,7 +756,7 @@ pub fn action_bank_deposit_gold_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -718,7 +778,7 @@ pub fn action_bank_withdraw_gold_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -740,7 +800,7 @@ pub fn action_bank_deposit_item_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -762,7 +822,7 @@ pub fn action_bank_withdraw_item_command_handler(
     api_key: &str,
     character_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     serde_json::to_vec(&[command_argument_map(command_arguments)])
         .map_err(Into::into)
         .and_then(|data| {
@@ -785,7 +845,7 @@ pub fn command_handler_router(
     character_name: &str,
     command_name: &str,
     command_arguments: &[(String, String)],
-) -> anyhow::Result<ActionResponseDataSchema> {
+) -> Result<ActionResponseDataSchema, ActionRequestError> {
     tracing::info!("routing command {command_name}");
     match command_name {
         "move" => action_move_command_handler(api_key, character_name, command_arguments),
@@ -809,9 +869,7 @@ pub fn command_handler_router(
         "bank-withdraw-gold" => {
             action_bank_withdraw_gold_command_handler(api_key, character_name, command_arguments)
         }
-        otherwise => Err(anyhow::anyhow!(
-            "unimplemented or unrecognized command: {otherwise:?}"
-        )),
+        otherwise => Err(ActionRequestError::UnrecognizedCommand(otherwise.into())),
     }
 }
 
