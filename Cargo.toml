@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/api",
+  "crates/core",
+  "crates/tui"
+]
+
+package = {
+  authors = ["joanna"],
+  edition = "2024",
+  version = "0.1.0"
+}
+
+dependencies = {
+  anyhow = { version = "1.0.104", features = [ "backtrace" ] },
+
+  artifacts-api = { path = "crates/api" },
+  artifacts-core = { path = "crates/core" },
+  artifacts-tui = { path = "crates/tui" },
+
+  chrono = { version = "0.4.45", features = ["serde"] },
+
+  serde = { version = "1.0.229", features = [ "derive" ] },
+  serde_json = "1.0.151",
+
+  tracing = { version = "0.1.44", features = [ "max_level_debug", "release_max_level_info" ] },
+  
+  ureq = { version = "3.3.0" },
+}
+
+[dependencies]
+anyhow = { workspace = true }
+
+artifacts-api = { workspace = true }
+artifacts-core = { workspace = true }
+artifacts-tui = { workspace = true }
+
+chrono = { workspace = true }
+dotenvy = "0.15.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = "0.2.5"
+tracing-subscriber = "0.3.23"
+ureq = { workspace = true }
+
+[package]
+name = "artifacts-mmorpg"
+edition = "2024"
+version = "0.1.0"
