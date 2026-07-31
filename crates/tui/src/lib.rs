@@ -1,3 +1,4 @@
+use artifacts_core::network::ActionResponseDataSchema;
 use ratatui::{
     crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers},
     prelude::*,
@@ -8,7 +9,10 @@ use core::ops::Deref;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering::*;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct StopFlag(Arc<AtomicBool>);
@@ -38,10 +42,42 @@ pub struct App {
     player_tracker: PlayerTrackerWidget,
     command_line_state: CommandLineState,
     pub cmd_tx: std::sync::mpsc::Sender<artifacts_core::UnmodifiedCommand>,
-    // res_rx: std::sync::mpsc::Receiver<artifacts_core::ActionResponseDataSchema>,
 }
 
 impl App {
+    pub fn run(
+        mut self,
+        character_name: String,
+        response_rx: mpsc::Receiver<ActionResponseDataSchema>,
+        tracker: &mut artifacts_core::PlayerTracker,
+    ) -> std::io::Result<()> {
+        ratatui::run(|terminal| {
+            loop {
+                if self.stop_flag.load(core::sync::atomic::Ordering::Acquire) {
+                    break;
+                };
+
+                let Ok(()) = self.run_once_inner(terminal, tracker) else {
+                    break;
+                };
+
+                match response_rx.try_recv() {
+                    Ok(response_schema) => {
+                        tracker
+                            .update_from_response_schema(&character_name, &response_schema)
+                            .expect("failed to update!");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break;
+                    }
+                    Err(_) => {
+                        // println!("")
+                    }
+                };
+            }
+            Ok(())
+        })
+    }
     pub fn new(
         player_name: String,
         cmd_tx: std::sync::mpsc::Sender<artifacts_core::UnmodifiedCommand>,
@@ -71,8 +107,10 @@ impl App {
         player_state: &mut artifacts_core::PlayerTracker,
     ) -> std::io::Result<()> {
         terminal.try_draw(|frame| self.draw(frame, player_state))?;
+        // now we check for next iteration, whether an update happened...
+        //
+        // afaik always goes `draw` -> `handle_events` so updates here are only visible on next iteration
         self.handle_events()?;
-
         Ok(())
     }
 
@@ -110,37 +148,16 @@ impl App {
             }
 
             if self.command_line_state.handle_crossterm_event(&event) {
-                let mut pending_command_line_iterator = core::iter::from_fn(|| {
-                    self.command_line_state.pending_buf.pop().map(|value| {
-                        value
-                            .split_whitespace()
-                            .map(<str>::to_string)
-                            .collect::<Box<[String]>>()
-                            .into_iter()
-                    })
-                })
-                .flatten();
-                let mut parser = artifacts_core::ArgParser::new(&mut pending_command_line_iterator);
+                let commands: Vec<String> =
+                    core::iter::from_fn(|| self.command_line_state.pending_buf.pop()).collect();
 
-                while let Some(cmd) = parser.parse_next_command() {
-                    let repeat_count = match &cmd.modifier {
-                        Some(artifacts_core::CommandModifier::Repeat(times)) => *times as usize,
-                        _ => 1,
-                    };
+                let mut parser = artifacts_core::CommandParser::new(commands);
 
-                    for _ in 0..repeat_count {
-                        let cmd = artifacts_core::UnmodifiedCommand {
-                            name: cmd.name.clone(),
-                            arguments: cmd.arguments.clone(),
-                        };
-                        self.cmd_tx
-                            .send(cmd.clone())
-                            .expect("failed to send command")
-                    }
+                for cmd in
+                    artifacts_core::task::expand_set(core::iter::from_fn(|| parser.parse_next()))
+                {
+                    self.cmd_tx.send(cmd).expect("failed to send command!");
                 }
-
-                tracing::info!("finished parsing {parser:?}");
-                // parser
             }
         };
 
