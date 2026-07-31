@@ -1,17 +1,7 @@
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
-use artifacts_api::{
-    ActionType, BankGoldTransactionResponseSchema, BankGoldTransactionSchema,
-    BankItemTransactionResponseSchema, BankItemTransactionSchema, CharacterFightDataSchema,
-    CharacterFightResponseSchema, CharacterMovementDataSchema, CharacterMovementResponseSchema,
-    CharacterRestDataSchema, CharacterRestResponseSchema, CharacterSchema, CooldownSchema,
-    EquipmentResponseSchema, EquipmentTransactionSchema, ItemSlot, MapLayer, MapSchema,
-    NpcMerchantTransactionSchema, RecyclingDataSchema, RecyclingResponseSchema, SkillDataSchema,
-    SkillResponseSchema, UseItemResponseSchema, UseItemSchema,
-};
+use artifacts_api::{ActionType, CooldownSchema, ItemSlot, MapLayer, MapSchema};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 #[derive(Debug)]
 pub struct CooldownTimestamps {
@@ -108,7 +98,7 @@ impl HealthTracker {
     pub fn update_from_action_response_data_schema(
         &mut self,
         character_name: &str,
-        response_schema: &ActionResponseDataSchema,
+        response_schema: &network::ActionResponseDataSchema,
     ) {
         if let Some(character_schema) = response_schema.character_schema(character_name) {
             self.active_health = Some(ActiveHealth {
@@ -229,7 +219,7 @@ impl PlayerTracker {
     pub fn update_from_response_schema(
         &mut self,
         character_name: &str,
-        response_schema: &ActionResponseDataSchema,
+        response_schema: &network::ActionResponseDataSchema,
     ) -> anyhow::Result<()> {
         if let Some(cooldown_schema) = response_schema.cooldown_schema() {
             self.cooldown.update_from_cooldown_schema(
@@ -249,16 +239,29 @@ impl PlayerTracker {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandModifier {
     Repeat(u32),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Command {
     pub name: String,
     pub modifier: Option<CommandModifier>,
     pub arguments: Box<[(String, String)]>,
+}
+
+impl Command {
+    pub fn into_unmodified(self) -> core::iter::RepeatN<UnmodifiedCommand> {
+        let count = self.repeat_count() as usize;
+        core::iter::repeat_n(
+            UnmodifiedCommand {
+                name: self.name,
+                arguments: self.arguments,
+            },
+            count,
+        )
+    }
 }
 
 /// Indicates that the responsibility of
@@ -268,9 +271,6 @@ pub struct UnmodifiedCommand {
     pub name: String,
     pub arguments: Box<[(String, String)]>,
 }
-
-unsafe impl Send for Command {}
-unsafe impl Sync for Command {}
 
 impl Command {
     pub fn repeated(self, times: u32) -> Command {
@@ -286,207 +286,11 @@ impl Command {
             ..Default::default()
         }
     }
-}
 
-pub fn command_argument_map(
-    command_arguments: &[(String, String)],
-) -> serde_json::Map<String, serde_json::Value> {
-    use core::str::FromStr;
-
-    command_arguments
-        .iter()
-        .fold(serde_json::Map::default(), |mut acc, (k, v)| {
-            let v = match k.as_ref() {
-                "code" | "slot" => serde_json::Value::String(v.clone()),
-                _ => serde_json::Value::Number(serde_json::Number::from_str(v).unwrap()),
-            };
-            let res = acc.insert(k.clone(), v);
-            debug_assert!(res.is_none(), "duplicate key in arg_map!");
-            acc
-        })
-}
-
-#[derive(Debug)]
-pub enum BankActionResponseDataSchema {
-    DepositGold(BankGoldTransactionSchema),
-    DepositItem(BankItemTransactionSchema),
-    WithdrawItem(BankItemTransactionSchema),
-    WithdrawGold(BankGoldTransactionSchema),
-}
-
-impl BankActionResponseDataSchema {
-    pub fn command_name(&self) -> &'static str {
-        match self {
-            BankActionResponseDataSchema::DepositGold(_) => "bank-deposit-gold",
-            BankActionResponseDataSchema::DepositItem(_) => "bank-deposit-item",
-            BankActionResponseDataSchema::WithdrawItem(_) => "bank-withdraw-item",
-            BankActionResponseDataSchema::WithdrawGold(_) => "bank-withdraw-gold",
-        }
-    }
-    pub fn cooldown_schema(&self) -> &CooldownSchema {
-        match self {
-            BankActionResponseDataSchema::DepositGold(gold_transaction_schema)
-            | BankActionResponseDataSchema::WithdrawGold(gold_transaction_schema) => {
-                &gold_transaction_schema.cooldown
-            }
-            BankActionResponseDataSchema::DepositItem(item_transaction_schema)
-            | BankActionResponseDataSchema::WithdrawItem(item_transaction_schema) => {
-                &item_transaction_schema.cooldown
-            }
-        }
-    }
-    pub fn character_schema(&self) -> &CharacterSchema {
-        match self {
-            BankActionResponseDataSchema::DepositGold(gold_transaction_schema)
-            | BankActionResponseDataSchema::WithdrawGold(gold_transaction_schema) => {
-                &gold_transaction_schema.character
-            }
-            BankActionResponseDataSchema::DepositItem(item_transaction_schema)
-            | BankActionResponseDataSchema::WithdrawItem(item_transaction_schema) => {
-                &item_transaction_schema.character
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum NpcActionResponseDataSchema {
-    BuyItem(NpcMerchantTransactionSchema),
-    SellItem(NpcMerchantTransactionSchema),
-}
-
-impl NpcActionResponseDataSchema {
-    pub fn command_name(&self) -> &'static str {
-        match self {
-            NpcActionResponseDataSchema::BuyItem(_) => "npc-buy",
-            NpcActionResponseDataSchema::SellItem(_) => "npc-sell",
-        }
-    }
-    pub fn cooldown_schema(&self) -> &CooldownSchema {
-        match self {
-            NpcActionResponseDataSchema::BuyItem(npc_merchant_transaction_schema)
-            | NpcActionResponseDataSchema::SellItem(npc_merchant_transaction_schema) => {
-                &npc_merchant_transaction_schema.cooldown
-            }
-        }
-    }
-    pub fn character_schema(&self) -> &CharacterSchema {
-        match self {
-            NpcActionResponseDataSchema::BuyItem(npc_merchant_transaction_schema)
-            | NpcActionResponseDataSchema::SellItem(npc_merchant_transaction_schema) => {
-                &npc_merchant_transaction_schema.character
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ActionResponseDataSchema {
-    Move(CharacterMovementDataSchema),
-    Fight(CharacterFightDataSchema),
-    Rest(CharacterRestDataSchema),
-    Gather(SkillDataSchema),
-    Unequip(EquipmentTransactionSchema),
-    Craft(SkillDataSchema),
-    Equip(EquipmentTransactionSchema),
-    Recycle(RecyclingDataSchema),
-    UseItem(UseItemSchema),
-    BankAction(BankActionResponseDataSchema),
-    NpcAction(NpcActionResponseDataSchema),
-}
-
-impl ActionResponseDataSchema {
-    pub fn command_name(&self) -> &'static str {
-        match self {
-            ActionResponseDataSchema::Move(_) => "move",
-            ActionResponseDataSchema::Fight(_) => "fight",
-            ActionResponseDataSchema::Rest(_) => "rest",
-            ActionResponseDataSchema::Gather(_) => "gather",
-            ActionResponseDataSchema::Unequip(_) => "unequip",
-            ActionResponseDataSchema::Craft(_) => "craft",
-            ActionResponseDataSchema::Equip(_) => "equip",
-            ActionResponseDataSchema::Recycle(_) => "recycle",
-            ActionResponseDataSchema::UseItem(_) => "use",
-            ActionResponseDataSchema::BankAction(bank_action_response_data_schema) => {
-                bank_action_response_data_schema.command_name()
-            }
-            ActionResponseDataSchema::NpcAction(npc_action_response_data_schema) => {
-                npc_action_response_data_schema.command_name()
-            }
-        }
-    }
-    pub fn cooldown_schema(&self) -> Option<&CooldownSchema> {
-        match self {
-            ActionResponseDataSchema::Move(character_movement_data_schema) => {
-                Some(&character_movement_data_schema.cooldown)
-            }
-            ActionResponseDataSchema::Fight(character_fight_data_schema) => {
-                Some(&character_fight_data_schema.cooldown)
-            }
-            ActionResponseDataSchema::Rest(character_rest_data_schema) => {
-                Some(&character_rest_data_schema.cooldown)
-            }
-            ActionResponseDataSchema::Gather(skill_data_schema)
-            | ActionResponseDataSchema::Craft(skill_data_schema) => {
-                Some(&skill_data_schema.cooldown)
-            }
-            ActionResponseDataSchema::Unequip(equipment_transaction_schema)
-            | ActionResponseDataSchema::Equip(equipment_transaction_schema) => {
-                Some(&equipment_transaction_schema.cooldown)
-            }
-            ActionResponseDataSchema::Recycle(recycling_data_schema) => {
-                Some(&recycling_data_schema.cooldown)
-            }
-            ActionResponseDataSchema::UseItem(use_item_schema) => Some(&use_item_schema.cooldown),
-            ActionResponseDataSchema::BankAction(bank_action_response_data_schema) => {
-                Some(bank_action_response_data_schema.cooldown_schema())
-            }
-            ActionResponseDataSchema::NpcAction(npc_action_response_data_schema) => {
-                Some(npc_action_response_data_schema.cooldown_schema())
-            }
-        }
-    }
-    pub fn map_schema(&self) -> Option<&MapSchema> {
-        if let ActionResponseDataSchema::Move(character_movement_data_schema) = self {
-            Some(&character_movement_data_schema.destination)
-        } else {
-            None
-        }
-    }
-    /// The character-name is only used in the case that we do not have a single character.
-    ///
-    /// For now, that only implies the [Fight](ActionResponseDataSchema::Fight) case,
-    /// as it could have been a multifight
-    pub fn character_schema(&self, character_name: &str) -> Option<&CharacterSchema> {
-        match self {
-            ActionResponseDataSchema::Move(_) => None,
-            ActionResponseDataSchema::Fight(character_fight_data_schema) => {
-                character_fight_data_schema
-                    .characters
-                    .iter()
-                    .find(|character_schema| character_schema.name.as_ref() == character_name)
-            }
-            ActionResponseDataSchema::Rest(character_rest_data_schema) => {
-                Some(&character_rest_data_schema.character)
-            }
-            ActionResponseDataSchema::Gather(skill_data_schema)
-            | ActionResponseDataSchema::Craft(skill_data_schema) => {
-                Some(&skill_data_schema.character)
-            }
-            ActionResponseDataSchema::Unequip(equipment_transaction_schema)
-            | ActionResponseDataSchema::Equip(equipment_transaction_schema) => {
-                Some(&equipment_transaction_schema.character)
-            }
-            ActionResponseDataSchema::Recycle(recycling_data_schema) => {
-                Some(&recycling_data_schema.character)
-            }
-            ActionResponseDataSchema::UseItem(use_item_schema) => Some(&use_item_schema.character),
-            ActionResponseDataSchema::BankAction(bank_action_response_data_schema) => {
-                Some(bank_action_response_data_schema.character_schema())
-            }
-            ActionResponseDataSchema::NpcAction(npc_action_response_data_schema) => {
-                Some(npc_action_response_data_schema.character_schema())
-            }
+    pub fn repeat_count(&self) -> u32 {
+        match self.modifier.as_ref() {
+            Some(CommandModifier::Repeat(value)) => *value,
+            _ => 1,
         }
     }
 }
@@ -502,108 +306,7 @@ fn apply_headers(
         .header("Authorization", format!("Bearer {}", api_key))
 }
 
-#[derive(Debug, Error)]
-pub enum ActionRequestError {
-    #[error("unrecognized command: {0}")]
-    UnrecognizedCommand(String),
-
-    #[error("something with the api: {0:?}")]
-    ApiError(CodedErrorObject),
-
-    #[error("failed to construct request: {0}")]
-    UreqHttp(#[from] ureq::http::Error),
-
-    #[error("request error: {0}")]
-    Ureq(#[from] ureq::Error),
-
-    #[error("serde error: {0}")]
-    Serde(#[from] serde_json::Error),
-}
-
-fn action_request_uri(
-    character_name: &str,
-    action_name: &str,
-) -> Result<ureq::http::Uri, ActionRequestError> {
-    ureq::http::Uri::builder()
-        .scheme("https")
-        .authority("api.artifactsmmo.com")
-        .path_and_query(format!("/my/{character_name}/action/{action_name}",))
-        .build()
-        .map_err(Into::into)
-}
-
-fn action_post_request_builder(
-    api_key: &str,
-    character_name: &str,
-    action_name: &str,
-) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>, ActionRequestError> {
-    action_request_uri(character_name, action_name)
-        .inspect_err(|e| tracing::error!(?e))
-        .map(ureq::post)
-        .map(|req| {
-            // apply the required headers, along with the api-key
-            req.header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .config()
-                // make sure to config the request to not
-                // eat the error payload!
-                .http_status_as_error(false)
-                .build()
-        })
-}
-
-fn send_action_request_inner(
-    api_key: &str,
-    character_name: &str,
-    action_name: &str,
-    data: &[u8],
-) -> Result<ureq::http::Response<ureq::Body>, ActionRequestError> {
-    action_post_request_builder(api_key, character_name, action_name)
-        .and_then(|req| req.send(data).map_err(Into::into))
-}
-
-#[tracing::instrument(level = "info", skip(api_key))]
-pub fn send_action_request<Response>(
-    api_key: &str,
-    character_name: &str,
-    action_name: &str,
-    data: &[u8],
-) -> Result<Response, ActionRequestError>
-where
-    Response: serde::de::DeserializeOwned,
-{
-    send_action_request_inner(api_key, character_name, action_name, data).and_then(|res| {
-        let status = res.status();
-        tracing::info!("status is {status}");
-        let rdr = res.into_body().into_reader();
-        if status.is_client_error() | status.is_server_error() {
-            /// Simple wrapper type that the API returns in this case, no need
-            /// to pollute local code to have this functionality
-            #[derive(Debug, Default, Deserialize, Serialize)]
-            struct CodedErrorObjectResponse {
-                error: CodedErrorObject,
-            }
-
-            let output: CodedErrorObjectResponse = serde_json::from_reader(rdr)?;
-            Err(ActionRequestError::ApiError(output.error))
-        } else {
-            tracing::info!("status is good!");
-            let output: Response = serde_json::from_reader(rdr)?;
-            Ok(output)
-        }
-    })
-}
-
-/// This should be mapped to individual error-types but
-/// represents an all purpose error type for most of the
-/// api-calls
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct CodedErrorObject {
-    pub code: u64,
-    pub message: Box<str>,
-    pub data: Option<serde_json::Value>,
-}
+pub mod network;
 
 pub struct ErrorData {
     pub message: Box<str>,
@@ -614,263 +317,6 @@ pub struct ErrorData {
 pub enum ActionMoveError {
     /// Code 404
     MapNotFound(ErrorData),
-}
-
-/// sends out move-request, is blocking
-pub fn action_move_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&command_argument_map(command_arguments))
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<CharacterMovementResponseSchema>(
-                api_key,
-                character_name,
-                "move",
-                &data,
-            )
-            .map(|res| ActionResponseDataSchema::Move(res.data))
-        })
-}
-
-/// blocking request
-pub fn action_fight_command_handler(
-    api_key: &str,
-    character_name: &str,
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    send_action_request::<CharacterFightResponseSchema>(api_key, character_name, "fight", &[])
-        .map(|res| ActionResponseDataSchema::Fight(res.data))
-}
-
-/// blocking request
-pub fn action_rest_command_handler(
-    api_key: &str,
-    character_name: &str,
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    send_action_request::<CharacterRestResponseSchema>(api_key, character_name, "rest", &[])
-        .map(|res| ActionResponseDataSchema::Rest(res.data))
-}
-
-/// blocking request
-pub fn action_gather_command_handler(
-    api_key: &str,
-    character_name: &str,
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    send_action_request::<SkillResponseSchema>(api_key, character_name, "gathering", &[])
-        .map(|res| ActionResponseDataSchema::Gather(res.data))
-}
-
-/// sends out unequip-request, is blocking
-///
-/// commands are currently only supported as a naive single set
-pub fn action_unequip_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<EquipmentResponseSchema>(
-                api_key,
-                character_name,
-                "unequip",
-                &data,
-            )
-            .map(|res| ActionResponseDataSchema::Unequip(res.data))
-        })
-}
-
-/// sends out craft-request, is blocking
-///
-/// commands are currently only supported as a naive single set
-pub fn action_craft_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&command_argument_map(command_arguments))
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<SkillResponseSchema>(api_key, character_name, "crafting", &data)
-                .map(|res| ActionResponseDataSchema::Craft(res.data))
-        })
-}
-
-/// sends out equip-request, is blocking
-///
-/// commands are currently only supported as a naive single set
-pub fn action_equip_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<EquipmentResponseSchema>(api_key, character_name, "equip", &data)
-                .map(|res| ActionResponseDataSchema::Equip(res.data))
-        })
-}
-
-/// sends out recycle-request, is blocking
-///
-/// commands are currently only supported as a naive single set
-pub fn action_recycle_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&command_argument_map(command_arguments))
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<RecyclingResponseSchema>(
-                api_key,
-                character_name,
-                "recycle",
-                &data,
-            )
-            .map(|res| ActionResponseDataSchema::Recycle(res.data))
-        })
-}
-
-/// sends out recycle-request, is blocking
-///
-/// commands are currently only supported as a naive single set
-pub fn action_use_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&command_argument_map(command_arguments))
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<UseItemResponseSchema>(api_key, character_name, "use", &data)
-                .map(|res| ActionResponseDataSchema::UseItem(res.data))
-        })
-}
-
-pub fn action_bank_deposit_gold_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<BankGoldTransactionResponseSchema>(
-                api_key,
-                character_name,
-                "bank/deposit/gold",
-                &data,
-            )
-            .map(|res| {
-                ActionResponseDataSchema::BankAction(BankActionResponseDataSchema::DepositGold(
-                    res.data,
-                ))
-            })
-        })
-}
-
-pub fn action_bank_withdraw_gold_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<BankGoldTransactionResponseSchema>(
-                api_key,
-                character_name,
-                "bank/withdraw/gold",
-                &data,
-            )
-            .map(|res| {
-                ActionResponseDataSchema::BankAction(BankActionResponseDataSchema::WithdrawGold(
-                    res.data,
-                ))
-            })
-        })
-}
-
-pub fn action_bank_deposit_item_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<BankItemTransactionResponseSchema>(
-                api_key,
-                character_name,
-                "bank/deposit/item",
-                &data,
-            )
-            .map(|res| {
-                ActionResponseDataSchema::BankAction(BankActionResponseDataSchema::DepositItem(
-                    res.data,
-                ))
-            })
-        })
-}
-
-pub fn action_bank_withdraw_item_command_handler(
-    api_key: &str,
-    character_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    serde_json::to_vec(&[command_argument_map(command_arguments)])
-        .map_err(Into::into)
-        .and_then(|data| {
-            send_action_request::<BankItemTransactionResponseSchema>(
-                api_key,
-                character_name,
-                "bank/withdraw/item",
-                &data,
-            )
-            .map(|res| {
-                ActionResponseDataSchema::BankAction(BankActionResponseDataSchema::WithdrawItem(
-                    res.data,
-                ))
-            })
-        })
-}
-
-pub fn command_handler_router(
-    api_key: &str,
-    character_name: &str,
-    command_name: &str,
-    command_arguments: &[(String, String)],
-) -> Result<ActionResponseDataSchema, ActionRequestError> {
-    tracing::info!("routing command {command_name}");
-    match command_name {
-        "move" => action_move_command_handler(api_key, character_name, command_arguments),
-        "fight" => action_fight_command_handler(api_key, character_name),
-        "rest" => action_rest_command_handler(api_key, character_name),
-        "gather" => action_gather_command_handler(api_key, character_name),
-        "unequip" => action_unequip_command_handler(api_key, character_name, command_arguments),
-        "craft" => action_craft_command_handler(api_key, character_name, command_arguments),
-        "equip" => action_equip_command_handler(api_key, character_name, command_arguments),
-        "recycle" => action_recycle_command_handler(api_key, character_name, command_arguments),
-        "use" => action_use_command_handler(api_key, character_name, command_arguments),
-        "bank-deposit-gold" => {
-            action_bank_deposit_gold_command_handler(api_key, character_name, command_arguments)
-        }
-        "bank-deposit-item" => {
-            action_bank_deposit_item_command_handler(api_key, character_name, command_arguments)
-        }
-        "bank-withdraw-item" => {
-            action_bank_withdraw_item_command_handler(api_key, character_name, command_arguments)
-        }
-        "bank-withdraw-gold" => {
-            action_bank_withdraw_gold_command_handler(api_key, character_name, command_arguments)
-        }
-        otherwise => Err(ActionRequestError::UnrecognizedCommand(otherwise.into())),
-    }
 }
 
 pub mod error_codes {
@@ -1112,21 +558,21 @@ fn command_args_list(command_name: &str) -> Option<CommandArgs> {
 }
 
 #[derive(Debug)]
-pub struct ArgParser<'a, I>
+pub struct LineParser<'a, I>
 where
     I: Iterator<Item = String>,
 {
-    args: &'a mut I,
+    it: &'a mut I,
     cached_command_name: Option<String>,
 }
 
-impl<'a, I> ArgParser<'a, I>
+impl<'a, I> LineParser<'a, I>
 where
     I: Iterator<Item = String>,
 {
-    pub fn new(args: &'a mut I) -> ArgParser<'a, I> {
-        ArgParser {
-            args,
+    pub fn new(it: &'a mut I) -> LineParser<'a, I> {
+        LineParser {
+            it,
             cached_command_name: None,
         }
     }
@@ -1136,7 +582,7 @@ where
         is_arg_valid: impl FnOnce(&str) -> bool,
     ) -> Option<(String, String)> {
         // let first_val = self.fst.take().or_else(|| self.args.next())?;
-        let first_val = self.args.next()?;
+        let first_val = self.it.next()?;
         tracing::info!("parsing next argument with first-value {first_val:?}");
         if !is_arg_valid(&first_val) {
             tracing::warn!(
@@ -1145,7 +591,7 @@ where
             self.cached_command_name = Some(first_val);
             None
         } else {
-            parse_request_argument(&first_val, || self.args.next())
+            parse_request_argument(&first_val, || self.it.next())
         }
     }
     fn args_from_valid_list(
@@ -1173,7 +619,7 @@ where
             cached_fst
         } else {
             // tracing::info!("next branch");
-            self.args.next()?
+            self.it.next()?
         };
 
         let (modifier, name): (Option<CommandModifier>, String) = if cached_value.starts_with('+')
@@ -1186,7 +632,7 @@ where
                     .parse::<u32>()
                     .ok()
                     .map(CommandModifier::Repeat),
-                self.args.next()?,
+                self.it.next()?,
             )
         } else {
             (None, cached_value)
@@ -1215,6 +661,458 @@ where
     }
 }
 
+fn parse_task_label_line(task_name: impl Into<Box<str>>, task_label_line: String) -> Option<Task> {
+    let (count, remainder) = task_label_line
+        .split_once(':')
+        .expect("malformed task label");
+
+    let count: u32 = if count.is_empty() {
+        1
+    } else {
+        count.parse().expect("malformed count")
+    };
+
+    let step = TaskStep::Invoke {
+        name: remainder.into(),
+        repeat: count,
+    };
+
+    Some(Task {
+        name: task_name.into(),
+        steps: Box::from([step]),
+    })
+}
+
+pub struct CommandParser {
+    pub commands: VecDeque<String>,
+}
+
+impl CommandParser {
+    pub fn new(commands: impl IntoIterator<Item = String>) -> CommandParser {
+        CommandParser {
+            commands: VecDeque::from_iter(commands),
+        }
+    }
+    pub fn parse_next(&mut self) -> Option<Task> {
+        let line = self.commands.pop_front()?;
+
+        // seems to be a task-label!
+        if line.contains(':') {
+            // here we can alter the syntax a bit by changing how the function works
+            parse_task_label_line("test-task", line)
+        } else {
+            // here we treat it as a regular command line
+            let mut line_iter = line.split_whitespace().map(<str>::to_string);
+
+            let mut parser = LineParser::new(&mut line_iter);
+
+            let mut step_buf = vec![];
+
+            while let Some(cmd) = parser.parse_next_command() {
+                step_buf.push(TaskStep::Cmd(cmd));
+            }
+
+            // step_buf.push(Task {name: "test-task-1", steps: step_buf.into_boxed_slice() });
+
+            Some(Task {
+                name: "test-task-1".into(),
+                steps: step_buf.into_boxed_slice(),
+            })
+            // let LineParser {
+            //     it,
+            //     cached_command_name,
+            // } = parser;
+
+            // let mut remainder_buf = vec![];
+
+            // if let Some(remainder) = cached_command_name {
+            //     remainder_buf.push(remainder);
+            // }
+
+            // for elt in it {
+            //     remainder_buf.push(elt)
+            // }
+
+            // let remainder = remainder_buf
+            //     .into_iter()
+            //     .fold(String::new(), |mut acc, elt| {
+            //         acc.push(' ');
+            //         acc.push_str(&elt);
+            //         acc
+            //     });
+
+            // if !remainder.is_empty() {
+            //     self.commands.push(remainder);
+            // }
+
+            // Some(Task {
+            //     name: "test".into(),
+            //     steps: Box::from_iter([TaskStep::Cmd(command)]),
+            // })
+        }
+    }
+}
+
+pub mod task {
+    use std::collections::{HashMap, HashSet};
+
+    use super::{Command, LineParser};
+
+    const MOVE_TO_COPPER_ORE: &str = "move -x 2 -y 0";
+    fn gather_copper_ore(n: impl core::fmt::Display) -> String {
+        format!("+x{n} gather")
+    }
+
+    const MOVE_TO_FORGE: &str = "move -x 1 -y 5";
+    fn craft_copper_bars(n: impl core::fmt::Display) -> String {
+        format!("craft -code copper_bar -quantity {n}")
+    }
+
+    const MOVE_TO_BANK: &str = "move -x 4 -y 1";
+    fn farm_copper(
+        n: u32,
+        withdraw_ore_from_bank: bool,
+        deposit_bars_into_bank: bool,
+    ) -> Vec<String> {
+        let mut base = vec![];
+
+        if withdraw_ore_from_bank {
+            base.extend_from_slice(&[
+                MOVE_TO_BANK.into(),
+                format!(
+                    "bank-withdraw-item -code copper_bar -quantity {n}",
+                    n = 10 * n
+                ),
+            ]);
+        } else {
+            base.extend_from_slice(&[
+                MOVE_TO_COPPER_ORE.into(),
+                format!("+x{n} gather", n = 10 * n),
+            ])
+        }
+
+        base.extend_from_slice(&[MOVE_TO_FORGE.into(), craft_copper_bars(n)]);
+
+        if deposit_bars_into_bank {
+            base.extend_from_slice(&[
+                MOVE_TO_BANK.into(),
+                format!("bank-deposit-item -code copper_bar -quantity {n}"),
+            ]);
+        }
+
+        base
+    }
+
+    const MOVE_TO_WEAPON_WORKSHOP: &str = "move -x 2 -y 1";
+    const MOVE_TO_GEAR_WORKSHOP: &str = "move -x 3 -y 1";
+
+    fn gather_and_craft_copper_helmet(n: u32, bank: bool) -> Vec<String> {
+        let mut base = vec![
+            MOVE_TO_COPPER_ORE.into(),
+            format!("+x{n} gather", n = 10 * (6 * n)),
+            MOVE_TO_FORGE.into(),
+            format!("craft -code copper_bar -quantity {n}", n = 6 * n),
+            MOVE_TO_GEAR_WORKSHOP.into(),
+            format!("craft -code copper_helmet -quantity {n}"),
+        ];
+
+        if bank {
+            base.extend_from_slice(&[
+                MOVE_TO_BANK.into(),
+                format!("bank-deposit-item -code copper_helmet -quantity {n}"),
+            ]);
+        }
+
+        base
+    }
+
+    fn move_craft_gear(
+        code: impl core::fmt::Display,
+        quantity: impl core::fmt::Display,
+    ) -> Vec<String> {
+        [
+            MOVE_TO_GEAR_WORKSHOP.into(),
+            format!("craft -code {code} -quantity {quantity}"),
+        ]
+        .into()
+    }
+
+    fn move_craft_weapon(
+        code: impl core::fmt::Display,
+        quantity: impl core::fmt::Display,
+    ) -> Vec<String> {
+        [
+            MOVE_TO_WEAPON_WORKSHOP.into(),
+            format!("craft -code {code} -quantity {quantity}"),
+        ]
+        .into()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum TaskStep {
+        Cmd(Command),
+        Invoke { name: String, repeat: u32 },
+    }
+
+    pub struct Task {
+        pub name: Box<str>,
+        pub steps: Box<[TaskStep]>,
+    }
+
+    impl Task {
+        pub fn commands(name: impl AsRef<str>, cit: impl Iterator<Item = Command>) -> Task {
+            Task {
+                name: name.as_ref().into(),
+                steps: cit.map(TaskStep::Cmd).collect(),
+            }
+        }
+        /// Flattens out `self`, loosing the task name in the process however
+        pub fn into_commands(self) -> Vec<Command> {
+            let Task { steps, name } = self;
+            tracing::info!("flattening task {name}");
+            let mut visited = HashSet::default();
+            steps.into_iter().fold(Vec::new(), |mut buf, step| {
+                match step {
+                    TaskStep::Cmd(command) => buf.push(command),
+                    TaskStep::Invoke { name, repeat } => {
+                        if let Some(commands_in_task_def) =
+                            resolve_invokeable(&name, repeat, &HashMap::default(), &mut visited)
+                        {
+                            buf.extend(commands_in_task_def);
+                        }
+                    }
+                }
+                buf
+            })
+        }
+    }
+
+    pub fn resolve_invokeable(
+        invokeable_name: &str,
+        repeat_count: u32,
+        user_defined_invokeables: &HashMap<String, Vec<TaskStep>>,
+        visited: &mut HashSet<String>,
+    ) -> Option<Vec<Command>> {
+        if !visited.insert(invokeable_name.to_string()) {
+            tracing::error!("Cycle hit on {invokeable_name}");
+            return None;
+        }
+
+        let out = resolve_invokeable_builtin(invokeable_name, repeat_count).or_else(|| {
+            user_defined_invokeables
+                .get(invokeable_name)
+                .and_then(|invokable_steps| {
+                    let mut out = vec![];
+                    for step in invokable_steps {
+                        match step {
+                            TaskStep::Cmd(command) => out.push(command.clone()),
+                            TaskStep::Invoke { name, repeat } => {
+                                // WARN: recursion here!
+                                //       if it turns out the label doesn't exist, we will
+                                //       get stack overflow at some point i think...
+                                //
+                                //       this essentially means some user invokeable
+                                //       references some other task!
+                                let resolved_in_user_task = resolve_invokeable(
+                                    name,
+                                    *repeat,
+                                    user_defined_invokeables,
+                                    visited,
+                                )?;
+                                out.extend(resolved_in_user_task);
+                            }
+                        }
+                    }
+                    Some(out)
+                })
+        });
+
+        visited.remove(invokeable_name);
+
+        out
+    }
+
+    fn resolve_gather(label: &str, line_buf: &mut Vec<String>) {
+        // copper gathering
+        //
+        // gather implies non-crafting, so raw resources
+        tracing::info!("RESOLVING GATHER from {label}");
+        match label.rsplit_once('_') {
+            Some(("g_copper_ore", digit)) if let Ok(gather_n) = digit.parse::<u32>() => line_buf
+                .extend([
+                    MOVE_TO_COPPER_ORE.into(),
+                    format!("+x{gather_n} gather"),
+                    MOVE_TO_BANK.into(),
+                    format!("bank-deposit-item -code copper_ore -quantity {gather_n}"),
+                ]),
+            Some(("g_copper", digit)) if let Ok(farm_n) = digit.parse::<u32>() => {
+                line_buf.extend(farm_copper(farm_n, false, true))
+            }
+            _ => {}
+        }
+    }
+
+    fn is_weapon_craftable(item_code: &str) -> bool {
+        matches!(item_code, "pickaxe" | "axe" | "dagger")
+    }
+
+    fn split_invokeable_label_with_item(label: &str) -> Option<(&str, &str, &str)> {
+        label.rsplit_once('_').and_then(|(name_and_item, count)| {
+            name_and_item
+                .rsplit_once('_')
+                .map(|(name, item)| (name, item, count))
+        })
+    }
+
+    /// Basically the same as `gc` commands, but when `c` prefixed
+    /// we do not perform the gather-step and instead withdraw ore from the bank
+    fn resolve_craft(label: &str, line_buf: &mut Vec<String>) {
+        tracing::info!("RESOLVING CRAFT from {label}");
+        match split_invokeable_label_with_item(label) {
+            Some(("c_copper", item_code, count))
+                if let Ok(craft_quantity) = count.parse::<u32>() =>
+            {
+                let move_craft_step = if is_weapon_craftable(item_code) {
+                    move_craft_weapon(item_code, craft_quantity)
+                } else {
+                    move_craft_gear(item_code, craft_quantity)
+                };
+
+                line_buf.extend(
+                    farm_copper(6 * craft_quantity, true, false)
+                        .into_iter()
+                        .chain(move_craft_step),
+                )
+            }
+            _ => {}
+        }
+    }
+    fn resolve_gather_craft(label: &str, line_buf: &mut Vec<String>) {
+        // split from front, to get craft-name and item-with-count
+        // separately
+        match split_invokeable_label_with_item(label) {
+            Some(("gc_copper", item_code, count))
+                if let Ok(craft_quantity) = count.parse::<u32>() =>
+            {
+                let move_craft_step = if is_weapon_craftable(item_code) {
+                    move_craft_weapon(item_code, craft_quantity)
+                } else {
+                    move_craft_gear(item_code, craft_quantity)
+                };
+
+                line_buf.extend(
+                    farm_copper(6 * craft_quantity, false, false)
+                        .into_iter()
+                        .chain(move_craft_step),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_invokeable_builtin(
+        invokeable_name: impl AsRef<str>,
+        repeat_count: u32,
+    ) -> Option<Vec<Command>> {
+        let mut cmd_line_buf = vec![];
+        match invokeable_name.as_ref() {
+            invokeable_label if invokeable_label.starts_with("gc_") => {
+                resolve_gather_craft(invokeable_label, &mut cmd_line_buf)
+            }
+            invokeable_label if invokeable_label.starts_with("g_") => {
+                resolve_gather(invokeable_label, &mut cmd_line_buf);
+            }
+            invokeable_label if invokeable_label.starts_with("c_") => {
+                resolve_craft(invokeable_label, &mut cmd_line_buf);
+            }
+            "g_copper_6" => cmd_line_buf.extend(farm_copper(6, false, true)),
+            // gather + craft
+            "gc_copper_pickaxe" => {
+                cmd_line_buf.extend(
+                    farm_copper(6, false, false)
+                        .into_iter()
+                        .chain(move_craft_weapon("copper_pickaxe", 1)),
+                );
+            }
+            "gc_copper_helmet" => {
+                cmd_line_buf.extend(
+                    farm_copper(6, false, false)
+                        .into_iter()
+                        .chain(move_craft_gear("copper_helmet", 1)),
+                );
+            }
+            // craft
+            "c_copper_pickaxe" => {
+                cmd_line_buf.extend(
+                    farm_copper(6, true, false)
+                        .into_iter()
+                        .chain(move_craft_weapon("copper_pickaxe", 1)),
+                );
+            }
+            "c_copper_helmet" => {
+                cmd_line_buf.extend(
+                    farm_copper(6, true, false)
+                        .into_iter()
+                        .chain(move_craft_gear("copper_helmet", 1)),
+                );
+            }
+            _ => return None,
+        };
+
+        // let mut step_buf = vec![];
+        let mut lines = cmd_line_buf
+            .into_iter()
+            .fold(Vec::new(), |mut acc, s| {
+                acc.extend(s.split_whitespace().map(<str>::to_string));
+                acc
+            })
+            .into_iter();
+        tracing::info!("LINE PARSER CONSTRUCTED");
+        let mut line_parser = LineParser::new(&mut lines);
+        // while let Some(step_cmd) = line_parser.parse_next_command() {
+        //     step_buf.push(TaskStep::Cmd(step_cmd));
+        // }
+
+        // Some(Task {
+        //     name: invokeable_name.as_ref().into(),
+        //     steps: core::iter::repeat_n(step_buf, repeat_count as usize)
+        //         .flatten()
+        //         .collect(),
+        // })
+        let command_vec: Vec<Command> =
+            core::iter::from_fn(|| line_parser.parse_next_command()).collect();
+        Some(
+            core::iter::repeat_n(command_vec, repeat_count as usize)
+                .flatten()
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn split_different_labels() {
+            assert_eq!(
+                split_invokeable_label_with_item("gc_copper_pickaxe_10"),
+                Some(("gc_copper", "pickaxe", "10"))
+            )
+        }
+    }
+
+    pub fn expand_set(
+        task_set: impl IntoIterator<Item = Task>,
+    ) -> impl Iterator<Item = super::UnmodifiedCommand> {
+        task_set
+            .into_iter()
+            .flat_map(Task::into_commands)
+            .flat_map(Command::into_unmodified)
+    }
+}
+
+pub use task::{Task, TaskStep};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,14 +1135,67 @@ mod tests {
         parse_next_opaque("equip -code copper_pickaxe -slot weapon")
             .expect("failed to parse equip");
     }
+    // #[test]
+    // fn serialize_equip_request_body_entry() {
+    //     let input = "equip -code copper_pickaxe -slot weapon";
+    //     let entry = EquipRequestBodyEntry {
+    //         code: "copper_pickaxe".into(),
+    //         slot: ItemSlot::Weapon,
+    //         quantity: None,
+    //     };
+    //     // is_valid_input_arg_for_request_object(input);
+    // }
+
     #[test]
-    fn serialize_equip_request_body_entry() {
-        let input = "equip -code copper_pickaxe -slot weapon";
-        let entry = EquipRequestBodyEntry {
-            code: "copper_pickaxe".into(),
-            slot: ItemSlot::Weapon,
-            quantity: None,
-        };
-        // is_valid_input_arg_for_request_object(input);
+    fn command_parser_action_sequence() {
+        let line = "move -x 0 -y 1 +x60 gather";
+        let mut p = CommandParser::new(vec![line.into()]);
+
+        let mut out_buf = vec![];
+
+        while let Some(t) = p.parse_next() {
+            out_buf.push(t);
+        }
+
+        assert_eq!(out_buf.len(), 1);
+        assert_eq!(out_buf[0].steps.len(), 2);
+        assert_eq!(
+            out_buf[0].steps[0],
+            TaskStep::Cmd(Command {
+                name: "move".into(),
+                modifier: None,
+                arguments: Box::from_iter([("x".into(), "0".into()), ("y".into(), "1".into())])
+            })
+        );
+        assert_eq!(
+            out_buf[0].steps[1],
+            TaskStep::Cmd(Command {
+                name: "gather".into(),
+                modifier: Some(CommandModifier::Repeat(60)),
+                arguments: Box::default()
+            })
+        );
+    }
+
+    #[test]
+    fn command_parser_task_label() {
+        let line = "4:craft_copper_helmet";
+        let mut p = CommandParser::new(vec![line.to_owned()]);
+
+        let mut out_buf = vec![];
+
+        while let Some(t) = p.parse_next() {
+            out_buf.push(t);
+        }
+
+        assert_eq!(out_buf.len(), 1);
+        // assert_eq!(out_buf[0].steps.len(), 4);
+        assert_eq!(
+            out_buf[0].steps[0],
+            TaskStep::Invoke {
+                name: "craft_copper_helmet".into(),
+                repeat: 4
+            },
+        );
     }
 }
