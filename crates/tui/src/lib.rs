@@ -259,7 +259,7 @@ impl StatefulWidget for &HealthTrackerWidget {
 
             Text::raw(format!("{current_value:3} / {max_value:3}")).render(health_label_area, buf);
 
-            let line_gauge_ratio = f64::max(1.0, *current_value as f64 / *max_value as f64);
+            let line_gauge_ratio = f64::min(1.0, *current_value as f64 / *max_value as f64);
 
             let line_gauge_filled_style = Style::default().light_green();
             let line_gauge_unfilled_style = Style::default().dim();
@@ -530,7 +530,7 @@ impl StatefulWidget for &CommandLineWidget {
     type State = CommandLineState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let paragraph_text = match &state.line_input {
+        let mut paragraph_text = match &state.line_input {
             CommandLineInput::Empty => Text::raw("> "),
             CommandLineInput::SingleCommand(command) => {
                 Text::raw(format!("> {}", command.as_str()))
@@ -549,6 +549,9 @@ impl StatefulWidget for &CommandLineWidget {
                 line
             }
         };
+        // add a lil cursor!
+        paragraph_text.push_span(Span::from(" ").reversed().slow_blink());
+
         Paragraph::new(paragraph_text)
             .block(Block::bordered().title("command"))
             .render(area, buf);

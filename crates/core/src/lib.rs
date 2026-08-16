@@ -95,6 +95,7 @@ pub struct HealthTracker {
 }
 
 impl HealthTracker {
+    #[tracing::instrument(level = "info")]
     pub fn update_from_action_response_data_schema(
         &mut self,
         character_name: &str,
